@@ -1,0 +1,615 @@
+#import s3fs
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SparkSession, DataFrame, Window
+from datetime import date, datetime, timedelta
+from pyspark.sql.functions import *
+import os, pyspark, ast, unicodedata, sys, json, logging, threading
+from pymongo import MongoClient
+import botocore.session
+import pandas as pd
+import pyspark.sql.types as T
+from functools import reduce
+import requests
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType, StructType, StructField, ArrayType
+
+
+#### Defs ####
+
+def getEnvVariables():
+    """
+    Retorna todas as variáveis de ambiente
+    """
+    path = {
+            'PAGEFULLPATH': os.environ['PAGEFULLPATH'], #Arquivo de regras
+            #'PAGEFULLPATH': 's3://bfb-ms-recommendation-batch-dev-resource/emr-feed-files/page_full/2021/03/25/godzilla-14:38.csv', #Arquivo de homologação
+
+            'BASEPATH': os.environ['BASEPATH'],         #Base de clientes
+            #'BASEPATH': 's3://bfb-ms-recommendation-batch-dev-resource/emr-feed-files/bases/bases_godzilla_dev/base_godzilla_homologacao.txt',
+
+            'HUBPATH': os.environ['HUBPATH'],           #hub.csv
+            #'HUBPATH': 's3://bfb-ms-recommendation-batch-dev-resource/emr-feed-files/bases/hub2.0.csv',
+        
+            'GRPMVSPATH': os.environ['GRPMVSPATH'],     #db_grp_mvs.txt
+            #'GRPMVSPATH': 's3://bfb-ms-recommendation-batch-dev-resource/emr-feed-files/bases/db_grp_mvs.txt',
+        
+            'MTRXPATH': os.environ['MTRXPATH'],         #mtrx_combinada.txt
+            #'MTRXPATH': 's3://bfb-ms-recommendation-batch-dev-resource/emr-feed-files/bases/mtrx_combinada.txt',
+        
+            'MOTORPATH': os.environ["MOTORPATH"],
+            #'MOTORPATH': 's3://bfb-ms-recommendation-batch-dev-resource/emr-feed-files/bases/IdMotor/*.csv',
+        
+            'ENVIRONMENT': os.environ['ENVIRONMENT'],   #dev, html, prd
+            #'ENVIRONMENT': 'dev',
+            
+            'BUCKET_S3': 's3://bfb-ms-recommendation-batch-{}-resource'.format(os.environ['ENVIRONMENT']),
+            #'BUCKET_S3': 's3://bfb-ms-recommendation-batch-dev-resource',
+        
+            'TABELA_DEPARA_REGRAS': 's3://bfb-ms-recommendation-batch-{}-resource/emr-feed-files/bases/depara_liferay.csv'.format(os.environ['ENVIRONMENT']), #Tabela de-para
+            #'TABELA_DEPARA_REGRAS': 's3://bfb-ms-recommendation-batch-dev-resource/emr-feed-files/bases/depara_liferay.csv',
+        
+            'OUTPUT_PREPRO': 's3://bfb-ms-recommendation-batch-{}-resource/emr-processed-files/output_prepro/'.format(os.environ['ENVIRONMENT']),
+            #'OUTPUT_PREPRO': 's3://bfb-ms-recommendation-batch-dev-resource/emr-processed-files/output_prepro/',
+        
+            'OUTPUT_PREPRO_RAW': 's3://bfb-ms-recommendation-batch-{}-resource/emr-processed-files/output_prepro/godzilla_recommend_raw'.format(os.environ['ENVIRONMENT']),
+            #'OUTPUT_PREPRO_RAW': 's3://bfb-ms-recommendation-batch-dev-resource/emr-processed-files/output_prepro/godzilla_recommend_raw',
+        
+            'OUTPUT_PREPRO_RECOMMEND': 's3://bfb-ms-recommendation-batch-{}-resource/emr-processed-files/output_prepro/godzilla_recommend'.format(os.environ['ENVIRONMENT']),
+            #'OUTPUT_PREPRO_RECOMMEND': 's3://bfb-ms-recommendation-batch-dev-resource/emr-processed-files/output_prepro/godzilla_recommend',
+
+            'OUTPUT_PREPRO_RECOMMEND_DELTA': 's3://bfb-ms-recommendation-batch-{}-resource/emr-processed-files/output_prepro/godzilla_recommend_delta'.format(os.environ['ENVIRONMENT']),
+            #'OUTPUT_PREPRO_RECOMMEND_DELTA': 's3://bfb-ms-recommendation-batch-dev-resource/emr-processed-files/output_prepro/godzilla_recommend_delta',
+            
+            'FULL': os.environ['FULL']
+            #'FULL': 'True'
+    }
+    return path
+
+
+def clusterInitialize():
+    botoSession = botocore.session.get_session()
+
+    sparkConf = SparkConf()
+    sparkConf.set("fs.s3a.experimental.fadvise", "random")
+    sparkConf.set("fs.s3a.awsAccessKeyId", botoSession.get_credentials().access_key)
+    sparkConf.set("fs.s3a.awsSecretAccessKey", botoSession.get_credentials().secret_key)
+    sparkConf.set("spark.hadoop.fs.s3.maxRetries", "20")
+    sparkConf.set("spark.sql.crossJoin.enabled", "true")
+
+    spark = SparkSession.builder.master("yarn").config(conf=sparkConf).getOrCreate()
+    sc = SparkContext.getOrCreate()
+
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+    return spark, sc, logger, logging
+
+def LoadGodzillaData(_path):
+    logger.info("## Start LoadGodzillaData")
+    
+    #Base de consumo dos clientes
+    _df_god = spark.read.csv(_path['BASEPATH'], header='true', inferSchema='true', sep='\t' )
+    _df_god = convertToLowerColumn(_df_god)
+
+    #db_grp_mvs
+    _df_mvs = spark.read.option("charset", "ISO-8859-1").csv(_path['GRPMVSPATH'], header='true', inferSchema='true', sep='\t')
+    _df_mvs = convertToLowerColumn(_df_mvs)
+
+    #matrix_combinada
+    _df_mtrx = spark.read.option("charset", "ISO-8859-1").csv(_path['MTRXPATH'], header='true', inferSchema='true', sep='\t')
+    _df_mtrx = convertToLowerColumn(_df_mtrx)
+
+    #Hub de conteudos
+    _df_hub = spark.read.csv(_path['HUBPATH'], header='true', inferSchema='true', sep=',').withColumn('chave_hub',col('hash_key'))
+    _df_hub = _df_hub.select(*values_into_columns(_df_hub))
+    _df_hub = convertToLowerColumn(_df_hub)
+
+    #De-para AplicaRegras
+    _df_depara_regras = spark.read.csv(_path['TABELA_DEPARA_REGRAS'], header='true', inferSchema='true', sep=",")
+    _df_depara_regras = _df_depara_regras.select(*values_into_columns(_df_depara_regras))
+    _df_depara_regras = convertToLowerColumn(_df_depara_regras)
+    _df_depara_regras = _df_depara_regras.na.fill("")
+
+    #PAGEFULLPATH: Arquivo de regras
+    _df_page_full = spark.read.csv(_path['PAGEFULLPATH'], header='true', inferSchema='true', sep=',')
+    _df_page_full = _df_page_full.select(*values_into_columns(_df_page_full))
+    _df_page_full = convertToLowerColumn(_df_page_full)
+    decode_filter = udf(requests.utils.unquote, StringType())
+    _df_page_full = _df_page_full.withColumn('carousel_filter', decode_filter(col('carousel_filter')))
+
+    #ID Motor
+    _df_motor = spark.read.csv(_path["MOTORPATH"], inferSchema=True, header=False)
+    _df_motor = _df_motor.select(*values_into_columns(_df_motor))
+    _df_motor = convertToLowerColumn(_df_motor)
+
+    logger.info("## Finish LoadGodzillaData")
+    
+    return _df_god, _df_mvs, _df_mtrx, _df_hub, _df_depara_regras, _df_page_full, _df_motor
+
+def exportMyPackageData(_path):
+    #Conectando no servidor
+    client = MongoClient('mongodb://172.27.19.253:27017')
+
+    #Recuperando collection microservices
+    db = client.microservices
+    db_eligibility = db.DEV_BFB_MS_ELIGIBILITY_DISPATCHER.find()
+    
+    db_eligibility = pd.DataFrame(list(db_eligibility))
+    db_eligibility = db_eligibility[["signatureId", "providers"]]
+
+    schema = StructType([
+        StructField('signatureId', T.StringType(), True),
+        StructField('providers', T.ArrayType(T.StringType()), True)
+    ])
+
+    df_pyspark = spark.createDataFrame(db_eligibility, schema)
+
+    file_path = _path + "DEV_BFB_MS_ELIGIBILITY_DISPATCHER.parquet"
+
+    df_pyspark.write.parquet(file_path, mode="overwrite")    
+    #db_eligibility.to_csv(file_path, index=False)
+
+    return file_path
+
+def loadMyPackageData(_path):
+    logger.info("## Start loadMyPackageData")
+
+    #Exportando dados do MongoDB e salvando CSV no S3
+    file_path = exportMyPackageData(_path)
+
+    #Carregando CSV com PySpark
+    #df_mypackage = spark.read.csv(file_path, inferSchema=True, header=True, sep=',')
+    df_mypackage = spark.read.parquet(file_path)
+    df_mypackage = df_mypackage.withColumn('providers', explode_outer('providers'))
+    
+    for column in df_mypackage.columns:
+            df_mypackage = df_mypackage.withColumn(column, clean_text(column))
+    
+    df_mypackage = df_mypackage.select(*values_into_columns(df_mypackage))
+    df_mypackage = convertToLowerColumn(df_mypackage)
+    df_mypackage = df_mypackage.groupBy('signatureid').agg(collect_list('providers').alias('providers'))
+    #df_mypackage = df_mypackage.withColumn("PROVIDERS", lower(col("providers")))
+
+    logger.info("## Finish loadMyPackageData")
+
+    return df_mypackage
+
+def myPackagePrepro(_df_god_result, _df_mypkg):
+    logger.info("## Start myPackagePrepro")
+    
+    # Cruzando base MEU PACOTE
+    _df_god_result = _df_god_result.join(_df_mypkg, _df_mypkg.signatureid == _df_god_result.customerid, 'left')
+
+    #Pre-processamento
+    #retrieve_array = udf(parse_array_from_string, T.ArrayType(T.StringType()))
+    #_df_god_result = _df_god_result.withColumn("PROVIDERS_2", retrieve_array(col("PROVIDERS")))
+    #_df_god_result = _df_god_result.withColumn("PROVIDER_2", split(col("PROVIDER"), ',').cast("array<string>"))
+    #_df_god_result = _df_god_result.withColumn("myPackage", arrays_overlap("PROVIDERS_2", "PROVIDER_2"))
+
+    _df_god_result = _df_god_result.withColumn("PROVIDER_2", split(col("PROVIDER"), ',').cast("array<string>"))
+    _df_god_result = _df_god_result.withColumn("myPackage", arrays_overlap("providers", "PROVIDER_2"))
+
+    logger.info("## Finish myPackagePrepro")
+    
+    return _df_god_result
+
+def godzillaRecommend(_df_god, _df_mvs, _df_mtrx, _df_hub):
+    logger.info("## Start godzillaRecommend")
+    
+    #Transforma matriz combinada (pivot), colunas em linhas
+    l_cols_f = _df_mtrx.drop('chave_aux').columns
+    v_str_ini = 'stack(' + str(len(l_cols_f))
+    for rr in l_cols_f:
+        v_cols = rr
+        v_str_ini = v_str_ini + ',' + chr(39) + v_cols + chr(39) + ',' + v_cols
+    v_str_end = ') as (colunas,score)'
+    v_str_final = v_str_ini + v_str_end
+    _df_mtrx_line = _df_mtrx.select('chave_aux', expr(v_str_final))
+
+
+    #Cruza base de clientes com db_grp_mvs
+    l_cols_god_mvs = ['chave_hub', 'customerid', 'perfil_id', 'eleg_controle', 'cumaux', 'tipo', 'chave_aux'
+                      ,when(concat('cumaux', 'tipo') == 11,0.2) \
+                      .when(concat('cumaux', 'tipo') == 21,0.15) \
+                      .when(concat('cumaux', 'tipo') == 31,0.1) \
+                      .when(concat('cumaux', 'tipo') == 41,0.05) \
+                      .when(concat('cumaux', 'tipo') == 12,0.25) \
+                      .when(concat('cumaux', 'tipo') == 22,0.15) \
+                      .when(concat('cumaux', 'tipo') == 32,0.1).alias('cte_pond')]
+    _df_god_mvs = _df_god.join(_df_mvs, 'chave_hub').drop(_df_god.tipo).select(l_cols_god_mvs)
+
+
+
+    #Somando os escores
+    #_df_god_sum = _df_god_mvs.join(_df_mtrx_line, 'chave_aux').groupBy('customerid', 'perfil_id', 'eleg_controle','colunas') \
+    #                              .agg(sum(col('score')*col('cte_pond')).alias('score'))
+
+    _df_god_sum = _df_god_mvs.join(_df_mtrx_line, 'chave_aux')
+    _df_god_sum = _df_god_sum.groupBy('customerid', 'perfil_id', 'eleg_controle','colunas') \
+                             .agg(sum(col('score')*col('cte_pond')).alias('score'))
+
+    #Tornando scores de canais ao vivo negativos
+    l_cols_w1 = ['customerid','perfil_id','eleg_controle','score','chave_hub']
+    _df_god_sum = _df_god_sum.join(_df_mvs, _df_god_sum.colunas == lower(col('chave_aux'))) \
+                             .withColumn('score', when(col('tipo') == 3, col('score') -1).otherwise(col('score'))).select(l_cols_w1)
+
+    
+    #Cruzando matriz de scores com hub
+    _df_god_sum = _df_god_sum.join(_df_hub, 'chave_hub').withColumn('id', col('chave_hub')).drop('chave_hub')
+    logger.info("## Finish godzillaRecommend")
+    
+    return _df_god_sum
+
+def containsMyPackage(value):
+    if len(value) == 0:
+        return False
+    else:
+        return 'MyPackage=true' in value
+
+def prepPageFull(_df_page_full, _df_depara_regras):
+    logger.info("## Start Tratamento page_full")
+
+    _df_page_full = _df_page_full.select("carousel_filter", "page_id", "carousel_id", "carousel_hash", "carousel_filter_id", "carousel_display_title")
+
+    # Filtragem por PageId's
+    lista = ['42671150','42943006', '42943022', '42942590', '45541954', '45782143', '46301543', '45961868','45961891', '45961914','45959225','45961940', '46436543', '46501708', '46501675', '46501695', '46578522', '46301543', '46512755', '46512778', '46512980', '46512844']
+    _df_page_full = _df_page_full.filter(col('page_id').isin(lista))
+     # Criação de coluna "hasMyPackage"
+    contains_udf = udf(containsMyPackage, T.BooleanType())
+    _df_page_full = _df_page_full.withColumn('hasMyPackage', contains_udf(col('carousel_filter')))
+    # Tratamento do dataframe:page_full_unicos
+    _df_page_full = _df_page_full.withColumn("carousel_filter2", regexp_replace(col("carousel_filter"), ("&MyPackage=true"), "")).drop(col("carousel_filter"))
+    _df_page_full = _df_page_full.withColumnRenamed("carousel_filter2","carousel_filter")
+    # Remoção de duplicatas
+    _df_page_full_unicos = _df_page_full.dropDuplicates(["carousel_filter"])
+    # Criação do dataframe "page full:duplicatas"
+    _df_page_full_duplicatas = _df_page_full.subtract(_df_page_full_unicos)
+
+    #df_page_full -> df_page_full_unicos
+    _df_page_full = _df_page_full_unicos.withColumn("regra_pop_quebra", split("carousel_filter", "&"))
+    _df_page_full = _df_page_full.withColumn("idx", monotonically_increasing_id())
+    w = Window.orderBy("idx")
+    _df_page_full = _df_page_full.withColumn("RowID", row_number().over(w)).drop("idx")
+    
+    _df_page_full = _df_page_full.withColumn('exploded', explode('regra_pop_quebra')).drop("regra_pop_quebra")
+    _df_page_full = _df_page_full.withColumn("quebra", split("exploded", "="))
+    _df_page_full = _df_page_full.withColumn('campo', col('quebra').getItem(0)) \
+                                .withColumn('valor', col('quebra').getItem(1)).drop("exploded", "quebra")
+
+    join = _df_page_full.join(_df_depara_regras, on = "campo", how = "left")
+    join = join.select("RowID", "page_id", "carousel_id", "carousel_hash", "carousel_filter", "carousel_filter_id", "carousel_display_title", "Coluna_Hub", "valor", "operador", "regra", "quebra")
+    join = join.withColumnRenamed("Coluna_Hub", "CAMPO")
+
+    req_dict = join.withColumn("dict", to_json(struct("campo", "valor", "operador", "regra", "quebra", "RowID")))
+    req_dict = req_dict.groupBy("RowID", "page_id", "carousel_id", "carousel_hash", "carousel_filter", "carousel_filter_id", "carousel_display_title").agg(collect_list("dict").alias("dicts")).orderBy("RowID")
+    collect_rules = req_dict.select("dicts").rdd.flatMap(lambda x: x).collect()
+
+    list_rules = list()
+    for rules in collect_rules:
+        #print('Before: ', rules)
+        result = return_rules(rules)
+        #print('After: ', result)
+        
+        #Selecionando apenas regras que tenham Recommendation or OrderByRecommendation = True
+        if (result['recomendation'] or result['orderByRecommendation']) == True:
+            list_rules.append(result)
+        else:
+            print('Não entrou: ', result)
+
+    logger.info("## Finish Tratamento page_full")
+    
+    return _df_page_full, list_rules, req_dict, _df_page_full_duplicatas
+
+def aplicaRegras_1(rule, _df_god_result, eleg_controle):
+    
+    orderby = rule["orderby"]
+    _df_god_result = _df_god_result.withColumn("RowID", lit(rule["RowID"]))
+
+    if eleg_controle == 2:
+        if rule["recomendation"] and rule["orderByRecommendation"] and not rule["filter"]:
+            return None
+        elif rule["recomendation"] and rule["orderByRecommendation"] and rule["filter"]:
+            orderby = "window_date_start"
+        elif rule["orderByRecommendation"]:
+            orderby = "window_date_start"
+            
+    if rule["filter"]:
+        #print('filter before: ', _df_god_result.count())
+        _df_god_result = _df_god_result.filter(rule["filter"])
+        #print('filter after: ', _df_god_result.count())
+        #print('filter: ', rule['filter'])
+
+    if rule["mypackage"]:
+        _df_god_result = _df_god_result.filter(rule["mypackage"])
+        
+    if orderby:
+        if rule["query_asc_desc"]:
+            _df_god_result = _df_god_result.orderBy(asc(orderby))
+        else:
+            _df_god_result = _df_god_result.orderBy(desc(orderby))
+    #else:
+        #print('Regra sem ordenação, rule[campo] ', rule['campo'])
+        #_df_god_result = _df_god_result.orderBy(desc(rule["campo"]))
+
+    _df_god_result = _df_god_result.withColumn("tamanho_pagesize", lit(rule["tamanho_pagesize"]))
+    _df_god_result = _df_god_result.withColumn("rule", lit(str(rule)))
+    
+    return _df_god_result
+
+def applyRules(df_god_result, list_rules, path_output, write_mode, req_dict):
+    logger.info("## Start applyRules")
+    logger.info("## Start select eleg_controle")
+    df_god_result_dev_controle, df_god_result_sem_dev_controle = df_god_result.filter("eleg_controle == '2'"), df_god_result.filter("eleg_controle != '2'")
+    logger.info("## Finish select eleg_controle")
+
+    df_list_final_1 = list()
+    rules_count = 0
+    aux_count = len(list_rules)
+    #mode = 'overwrite' if flag_full == 'True' else 'append'
+    mode = write_mode
+    date_execution = current_timestamp()
+    for rule in list_rules:
+    
+        #Se não tiver recomendação, aplique a regra para a base inteira
+        if not rule["orderByRecommendation"]:
+            print('Nunca mais deve passar por aqui!')
+            df_list_final_1.append(aplicaRegras_1(rule, df_god_result, ""))
+            
+        #Caso tenha recomendação, os clientes fora do grupo controle receberam conteúdos recomendados e o grupo controle não receberá nada de recomendação
+        elif rule["orderByRecommendation"]:
+            #if len(df_god_result_dev_controle.take(1)): 
+            result = aplicaRegras_1(rule, df_god_result_dev_controle, 2)
+            df_list_final_1.append(result) #Grupo controle sem recomendação
+            
+            #if len(df_god_result_sem_dev_controle.take(1)):
+            result = aplicaRegras_1(rule, df_god_result_sem_dev_controle, "")
+            df_list_final_1.append(result) #Usuários que irão receber recomendação
+
+        rules_count+=1
+        if rules_count == 50 or rules_count == aux_count:
+            aux_count = aux_count - rules_count
+            rules_count = 0
+            if df_list_final_1:
+                print("Salvando no bucket: {}".format(path_output),' | mode: ', mode)
+          
+                #Removendo items NoneType
+                df_final = [d for d in df_list_final_1 if type(d) is not type(None)]
+                
+                df_final = unionAll(df_final)
+                df_final = df_final.join(broadcast(req_dict.select("RowID", "page_id", "carousel_id", "carousel_hash", "carousel_filter_id", "carousel_display_title", "carousel_filter")), on = "RowID", how = "left")
+                df_final = df_final.withColumn('date_execution', lit(date_execution))
+                save_hdfs_aplica_regras_pyspark(df_final, path_output, mode)
+                mode = 'append'
+                df_list_final_1 = list()
+
+def save_hdfs_aplica_regras_pyspark(df_list_final, path, _mode):
+    df_list_final.coalesce(50).write.mode(_mode).parquet(path)
+
+def junta_results(_df_page_full_duplicatas, path_output_prepro_recommend):
+
+    # Carga da recomendação já processada
+    logger.info("## carga do godzilla_recommend e filtragem")
+    godzilla_recommend = spark.read.parquet(path_output_prepro_recommend)
+       
+    # Join entre os dataframes "recomendação processada" e "duplicatas"
+    logger.info("## entrada no processo do join unicos_duplicatas")
+    recomendacao = _df_page_full_duplicatas.join(godzilla_recommend, on="carousel_filter", how="inner")\
+    .select(_df_page_full_duplicatas.page_id, _df_page_full_duplicatas.carousel_id,
+    _df_page_full_duplicatas.carousel_hash, _df_page_full_duplicatas.hasMyPackage, _df_page_full_duplicatas.carousel_filter,
+    _df_page_full_duplicatas.carousel_filter_id, _df_page_full_duplicatas.carousel_display_title,
+    godzilla_recommend.RowID,godzilla_recommend.customerid,godzilla_recommend.perfil_id,
+    godzilla_recommend.eleg_controle,godzilla_recommend.score,godzilla_recommend.hash_key,godzilla_recommend.program_id,
+    godzilla_recommend.genre,godzilla_recommend.person,godzilla_recommend.keyword,godzilla_recommend.program_type,
+    godzilla_recommend.release_year,godzilla_recommend.title,godzilla_recommend.description,godzilla_recommend.created_at,
+    godzilla_recommend.price,godzilla_recommend.channel_number,godzilla_recommend.keyword_base,
+    godzilla_recommend.window_date_start,godzilla_recommend.window_date_end,godzilla_recommend.vod_type,
+    godzilla_recommend.provider,godzilla_recommend.id,godzilla_recommend.signatureid,godzilla_recommend.providers,
+    godzilla_recommend.PROVIDER_2,godzilla_recommend.myPackage,godzilla_recommend.tamanho_pagesize,
+    godzilla_recommend.rule,godzilla_recommend.date_execution)
+    
+    recomendacao_smp = recomendacao.filter(col("hasMyPackage")==False)
+    recomendacao_cmp = recomendacao.filter((col("hasMyPackage")==True) & (col("myPackage")==True))
+
+    # Salvando o dataframe "duplicatas": append no parquet "recomendação processada"
+    logger.info("## Salvando o resultado final")
+    save_hdfs_aplica_regras_pyspark(recomendacao_smp, path_output_prepro_recommend, 'append')
+    save_hdfs_aplica_regras_pyspark(recomendacao_cmp, path_output_prepro_recommend, 'append')
+
+def unionAll(df_list):
+    return reduce(DataFrame.unionAll, df_list)
+
+def make_trans():
+    matching_string = ""
+    replace_string = ""
+    for i in range(ord(" "), sys.maxunicode):
+        name = unicodedata.name(chr(i), "")
+        if "WITH" in name:
+            try:
+                base = unicodedata.lookup(name.split(" WITH")[0])
+                matching_string += chr(i)
+                replace_string += base
+            except KeyError:
+                pass
+
+    return matching_string, replace_string
+
+def clean_text(c):
+    matching_string, replace_string = make_trans()
+    return translate(regexp_replace(c, "\p{M}", ""), matching_string, replace_string).alias(c)
+
+def parse_array_from_string(x):
+    return ast.literal_eval(str(x))
+
+def values_into_columns(df):
+    return [lower(col(x)).alias(x) for x in df.columns]
+
+def convertToLowerColumn(df):
+    return df.toDF(*[c.lower().strip() for c in df.columns])
+
+def return_rules(rules):
+    resultado_query, query_order, query_asc_desc, recomendation, orderByRecommendation, operador, campo, valor, pageSize, tamanho_pagesize, mypackage = \
+        list(), None, None, False, False, None, None, list(), None, None, None
+    dict_rules = {}
+
+    for r in rules:
+        d = json.loads(r)
+
+        try:
+            if 'campo' in d.keys():
+                if d["campo"] != "recommendation" and d["campo"] != "pagesize" and d["campo"] != "mypackage":
+                   
+                    if d["operador"] != "order":
+                        campo = d["campo"]
+                        operador = d["operador"]
+                        
+                        if d["valor"].find(d["quebra"]) != -1:
+                            d["valor"] = str(d["valor"]).split(d["quebra"])
+                            valor = d["valor"]
+                            
+                            if operador != 'like': d["valor"] = "', '".join(d["valor"])   
+                        else:
+                            valor.append(d["valor"])
+                            
+                        #TODO: Correção para filtro genre com mais de um valor
+                        if operador == 'like' and (len(d['valor'])>1 and type(d['valor']) is list):
+                            _resultado = []
+                            for valor in d['valor']:
+                                _valor = d["regra"].format(valor)
+                                resultado = "{0} {1} {2}".format(d['campo'], d['operador'], _valor)
+                                _resultado.append(resultado)
+                             
+                            _resultado = ' and '.join(_resultado)
+                            resultado_query.append(_resultado)
+                            
+                        else:
+                            d["valor"] = d["regra"].format(d["valor"])
+                            resultado = "{0} {1} {2}".format(d['campo'], d['operador'], d['valor'])
+                            resultado_query.append(resultado)
+
+                    elif d["operador"] == "order":
+                        query_order = d["campo"]
+
+                        if d["valor"] == "asc":
+                            query_asc_desc = True
+                        elif d["valor"] == "desc":
+                            query_asc_desc = False
+                        elif d["valor"] == "true":
+                            orderByRecommendation = True
+                            query_asc_desc = False
+
+                elif d["campo"] == "recommendation":
+                    recomendation = True
+
+                elif d["campo"] == "pagesize":
+                    tamanho_pagesize = d['valor']
+                    pageSize = "{0} {1} {2}".format(d['campo'], d['operador'], d['valor'])
+
+                elif d["campo"] == "mypackage":
+                    d["valor"] = d["regra"].format(d["valor"])
+                    mypackage = "lower({0}) {1} {2}".format(d['campo'], d['operador'], d['valor'])
+
+        except Exception:
+            print(d)
+
+    if not pageSize:
+        tamanho_pagesize = 100
+        pageSize = "pagesize <= {}".format(tamanho_pagesize)
+
+    resultado_juncao = " and ".join(resultado_query)
+
+    dict_rules = {
+        "RowID": d["RowID"], 
+        "filter_pageSize": pageSize, 
+        "recomendation": recomendation, 
+        "orderByRecommendation": orderByRecommendation,
+        "filter": resultado_juncao, 
+        "orderby": query_order, 
+        "query_asc_desc": query_asc_desc, 
+        "operador": operador, 
+        "campo": campo, 
+        "valor": valor,
+        "tamanho_pagesize": int(tamanho_pagesize), 
+        "mypackage": mypackage 
+    }
+    
+    return dict_rules
+
+#### Defs ####
+
+#### main ####
+
+if __name__ == "__main__":
+
+    path = getEnvVariables()
+    spark, sc, logger, logging = clusterInitialize()
+
+    df_god, df_mvs, df_mtrx, df_hub, df_depara_regras, df_page_full, df_motor = LoadGodzillaData(path)
+    
+    #Persistindo dados em memória
+    print('df_god.persist().count(): ', df_god.persist().count())
+    print('df_mvs.persist().count(): ', df_mvs.persist().count())
+    print('df_mtrx.persist().count(): ', df_mtrx.persist().count())
+    print('df_hub.persist().count(): ', df_hub.persist().count())
+
+    #Recommend Godzilla
+    if path['FULL'] == 'True':
+        
+        df_god_result = godzillaRecommend(df_god, df_mvs, df_mtrx, df_hub)
+
+        df_mypkg = loadMyPackageData(path['OUTPUT_PREPRO'])
+        print('df_mypkg.persist().count(): ', df_mypkg.persist().count())
+        df_god_result = myPackagePrepro(df_god_result, df_mypkg)
+
+        columns_god_result = ["customerid", "perfil_id", "eleg_controle", "score", "hash_key", "program_id", "genre", "person", "keyword", "program_type",
+                            "release_year", "title", "description", "created_at", "price", "channel_number", "keyword_base", "window_date_start", "window_date_end",
+                            "vod_type", "provider", "id", "signatureid", "myPackage"]
+  
+        for column in columns_god_result:
+            df_god_result = df_god_result.withColumn(column, clean_text(column))
+
+        #Escreve parquet com dados raw
+        logger.info("## Start escrita arquivo raw")
+        df_god_result.coalesce(100).write.mode('overwrite').parquet(path['OUTPUT_PREPRO_RAW'])
+        logger.info("## Finish escrita arquivo raw")
+
+    #Carrega parquet com dados raw e persiste em memória
+    logger.info("## Start leitura arquivo raw")
+    df_god_result = spark.read.parquet(path['OUTPUT_PREPRO_RAW'])
+    df_god_result.persist().count()
+    logger.info("## Finish leitura arquivo raw")
+
+    df_page_full, list_rules, req_dict, df_page_full_duplicatas = prepPageFull(df_page_full, df_depara_regras)
+
+    #Se FULL = True, significa que o page_full deve ser processado por completo
+    if path['FULL'] == 'True':
+        #AplicaRegras e escreve parquet pré-processado: Processa e escreve os resultados para carrosséis únicos
+        mode = 'overwrite'
+        applyRules(df_god_result, list_rules, path['OUTPUT_PREPRO_RECOMMEND'], mode, req_dict)
+        # Faz o join entre a recomendação e as duplicatas e grava o resultado
+        junta_results(df_page_full_duplicatas, path['OUTPUT_PREPRO_RECOMMEND'])
+
+    #Senão, o page_full contempla apenas as regras que foram atualizadas durante o dia e deve processar apenas a diferença (delta). 
+    else:
+        #Escreve o resultado do aplica regras em um diretório separado (delta)
+        mode = 'overwrite'
+        applyRules(df_god_result, list_rules, path['OUTPUT_PREPRO_RECOMMEND_DELTA'], mode, req_dict)
+        junta_results(df_page_full_duplicatas, path['OUTPUT_PREPRO_RECOMMEND_DELTA'])
+
+        #Carregando recommend FULL = True
+        df_recommend = spark.read.parquet(path['OUTPUT_PREPRO_RECOMMEND'])
+        
+        #Carregando recommend FULL = False (delta)
+        df_delta = spark.read.parquet(path['OUTPUT_PREPRO_RECOMMEND_DELTA'])
+                
+        #Junção recommend FULL + delta
+        df_union = unionAll([df_recommend, df_delta])
+        
+        #Atualiza carrosseis da execução FULL com novos resultados do DELTA
+        mode = 'overwrite'
+        window = Window.partitionBy(['page_id', 'carousel_id', 'carousel_filter_id'])
+        df_union = df_union.withColumn('last_date_execution', max('date_execution').over(window)).where(col('date_execution') == col('last_date_execution'))
+        df_union = df_union.drop('last_date_execution')
+        print(df_union.persist().count())
+        save_hdfs_aplica_regras_pyspark(df_union, path['OUTPUT_PREPRO_RECOMMEND'], mode)
+ 
+#### main ####
